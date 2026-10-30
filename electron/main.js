@@ -58,9 +58,11 @@ const {
   loadEncryptedXAuth,
   clearEncryptedXAuth,
 } = require('./xAuthStorage');
-const { scheduleMinimizeToTray } = require('./windowLifecycle');
+const { scheduleMinimizeToTray, createRepaintRecovery } = require('./windowLifecycle');
 
 let mainWindow;
+/** Repaint/frame-recovery guard for the current window (see windowLifecycle.js). */
+let repaintRecovery = null;
 let tray = null;
 // True only when the user explicitly quits (tray menu / Cmd+Q / before-quit).
 // Distinguishes "hide to tray" from "really exit" for close-to-tray (#345).
@@ -394,7 +396,62 @@ function createWindow() {
     });
   });
 
+  // Windows can park the content view after tray hide/show, full occlusion by
+  // another window, or a display-topology switch (virtual display drivers):
+  // the HWND is visible again but the renderer never commits another frame, so
+  // the window keeps its last painted pixels while the process stays idle and
+  // healthy. Force a repaint on every visibility transition and fall back to a
+  // single guarded reload when the renderer stops answering the probe.
+  repaintRecovery = createRepaintRecovery({
+    win: mainWindow,
+    invalidate: () => {
+      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.invalidate();
+    },
+    // A frame still in flight (navigation/reload) is not a stalled renderer:
+    // never arm the reload fallback while the page is loading. The answer is
+    // the page's own visibility state — `hidden` on an on-screen window is the
+    // divergence that leaves a stale frame.
+    probe: () => {
+      const contents = mainWindow && !mainWindow.isDestroyed() ? mainWindow.webContents : null;
+      if (!contents || contents.isDestroyed()) return Promise.reject(new Error('webContents destroyed'));
+      if (contents.isLoading()) return Promise.resolve('visible');
+      return contents.executeJavaScript('document.visibilityState', true);
+    },
+    // Cycle the native window: the browser process only re-runs visibility
+    // bookkeeping on a real transition, which is what un-parks the renderer.
+    reveal: () => {
+      if (!mainWindow || mainWindow.isDestroyed()) return;
+      mainWindow.hide();
+      mainWindow.show();
+      mainWindow.focus();
+    },
+    reload: () => {
+      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.reload();
+    },
+    log: (entry) => {
+      try {
+        diagLog.record({
+          level: 'warn',
+          module: 'electron.window',
+          message: 'Content view repaint recovery',
+          data: redact.sanitizeForLog(entry),
+        });
+      } catch {
+        // Diagnostics must never break window handling.
+      }
+    },
+  });
+
+  for (const eventName of ['show', 'restore', 'focus']) {
+    mainWindow.on(eventName, () => repaintRecovery?.notifyShown(eventName));
+  }
+  for (const eventName of ['hide', 'minimize']) {
+    mainWindow.on(eventName, () => repaintRecovery?.notifyHidden());
+  }
+
   mainWindow.on('closed', () => {
+    repaintRecovery?.dispose();
+    repaintRecovery = null;
     mainWindow = null;
   });
 }
@@ -1043,6 +1100,10 @@ function restoreMainWindow() {
   if (mainWindow.isMinimized()) mainWindow.restore();
   if (!mainWindow.isVisible()) mainWindow.show();
   mainWindow.focus();
+  // The window can be on screen while the content view is still parked
+  // (Electron's visibility state lagging behind the native window); the tray
+  // path is the only recovery entry point users have, so force a repaint here.
+  repaintRecovery?.notifyShown('tray');
 }
 
 function refreshTrayMenu() {
